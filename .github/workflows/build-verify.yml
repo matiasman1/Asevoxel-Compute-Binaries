@@ -96,6 +96,7 @@ jobs:
 
       - name: Publish release
         if: steps.rev.outputs.already_built == 'false'
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
