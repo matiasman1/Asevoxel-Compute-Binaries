@@ -47,14 +47,14 @@ typedef struct {
   float M[16];  // Model (world transform)
   float V[16];  // View
   float P[16];  // Projection
-
+  
   // Camera orientation (quaternion: x, y, z, w)
   float q_view[4];
-
+  
   // Rotation components for view-to-model transforms
   // Array of 6 doubles: [cos(x), sin(x), cos(y), sin(y), cos(z), sin(z)]
   const double* rotation;  // NULL if no rotation info available
-
+  
   // Lighting (up to 8 lights)
   int num_lights;
   struct {
@@ -62,21 +62,21 @@ typedef struct {
     float intensity;    // Diffuse multiplier
     float spec_power;   // Specular exponent
   } lights[8];
-
+  
   // Model geometry info (for radial attenuation)
   float model_center[3];  // Model center in world coordinates
   float model_radius;     // Model bounding sphere radius
-
+  
   // Voxel model accessor (opaque handle)
   void* model;  // Host provides query functions
-
+  
   // Output buffer (host-provided RGBA buffer for shader to write to)
   unsigned char* output_buffer;  // Shader writes computed colors here
   int output_stride;             // Bytes per row (usually width*4)
-
+  
   // Time
   float time_sec;  // Seconds since render start
-
+  
   // Frame info
   int width;
   int height;
@@ -124,28 +124,28 @@ typedef struct {
   native_version_t (*api_version)(void);
   const char*    (*shader_id)(void);      // Stable ID (e.g., "pixelmatt.basic_lighting")
   const char*    (*display_name)(void);   // UI name (e.g., "Basic Lighting")
-
+  
   // Parameter schema
   const native_param_def_t* (*params_schema)(int* out_count);
-
+  
   // Lifecycle
   void*  (*create)(void);                 // Allocate shader instance
   void   (*destroy)(void* instance);      // Free shader instance
   int    (*set_param)(void* instance, const char* key, const void* value);
-
+  
   // Execution hooks (return 0 on success, non-zero on error)
   int (*run_pre)(void* instance, const native_ctx_t* ctx);
   // New: run_voxel/run_face must fill out_rgba[4] with computed color (0-255)
   int (*run_voxel)(void* instance, const native_ctx_t* ctx, int x, int y, int z, unsigned char out_rgba[4]);
   int (*run_face)(void* instance, const native_ctx_t* ctx, int x, int y, int z, int face_idx, unsigned char out_rgba[4]);
-
+  
   // Batch processing (Phase 2)
   // Process multiple faces at once. Shader should modify faces[i].r/g/b/a in place.
   int (*run_voxel_batch)(void* instance, const native_ctx_t* ctx, int count, native_face_data_t* faces);
 
   int (*run_image)(void* instance, const native_ctx_t* ctx);
   int (*run_post)(void* instance, const native_ctx_t* ctx);
-
+  
   // Threading hint
   int (*parallelism_hint)(void);  // 0 = auto, 1 = serial, N = preferred thread count
 } native_shader_v1_t;
