@@ -2,10 +2,10 @@ name: Build & publish verified binaries
 
 on:
   workflow_dispatch: {}
-  schedule:
-    # Once a day. Cheap no-op if the source repo's HEAD hasn't moved since the
-    # last published build (checked in the "skip if already built" step below).
-    - cron: '17 6 * * *'
+  push:
+    branches: [main]
+    paths:
+      - 'source/**'
 
 permissions:
   contents: write
@@ -16,24 +16,17 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - name: Checkout Asevoxel-Dev source
+      - name: Checkout this repo (mirrored source)
         uses: actions/checkout@v4
-        with:
-          repository: matiasman1/Asevoxel-Dev
-          path: source
-          fetch-depth: 1
 
-      - name: Resolve source commit and skip if already built
+      - name: Resolve source revision and skip if already built
         id: rev
         shell: bash
         run: |
-          cd source
           sha=$(git rev-parse HEAD)
           short=${sha:0:12}
-          version=$(grep -oP '"version":\s*"\K[^"]+' package.json || echo "unknown")
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "short=$short" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
           tag="build-$short"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -61,13 +54,12 @@ jobs:
         shell: msys2 {0}
         run: |
           set -e
-          mkdir -p source/bin
-          cd source
+          mkdir -p bin
           g++ -O2 -std=c++17 -static-libgcc -static-libstdc++ \
-            -Isrc -I/ucrt64/include \
+            -Isource/src -I/ucrt64/include \
             -o bin/asevoxel_compute.exe \
-            src/asevoxel_compute.cpp src/opencl_init.cpp src/io_pipeline.cpp \
-            src/render_gpu.cpp src/daemon.cpp src/ws_server.cpp \
+            source/src/asevoxel_compute.cpp source/src/opencl_init.cpp source/src/io_pipeline.cpp \
+            source/src/render_gpu.cpp source/src/daemon.cpp source/src/ws_server.cpp \
             -Wl,-Bstatic -lpthread -Wl,-Bdynamic -lOpenCL -lws2_32
           cp /ucrt64/bin/libwinpthread-1.dll bin/ || true
 
@@ -76,10 +68,9 @@ jobs:
         shell: msys2 {0}
         run: |
           set -e
-          mkdir -p source/render/bin
-          cd source
+          mkdir -p render_bin
           g++ -O2 -std=c++17 -shared -static -static-libgcc -static-libstdc++ -fopenmp \
-            -o render/bin/asevoxel_native.dll asevoxel_native.cpp \
+            -o render_bin/asevoxel_native.dll source/asevoxel_native.cpp \
             -I/ucrt64/include -llua -lpthread -lgomp
 
       - name: Checksum binaries
@@ -88,9 +79,9 @@ jobs:
         run: |
           set -e
           mkdir -p out
-          cp source/bin/asevoxel_compute.exe out/
-          cp source/render/bin/asevoxel_native.dll out/
-          [ -f source/bin/libwinpthread-1.dll ] && cp source/bin/libwinpthread-1.dll out/ || true
+          cp bin/asevoxel_compute.exe out/
+          cp render_bin/asevoxel_native.dll out/
+          [ -f bin/libwinpthread-1.dll ] && cp bin/libwinpthread-1.dll out/ || true
           cd out
           sha256sum * > CHECKSUMS.sha256
           cat CHECKSUMS.sha256
@@ -110,20 +101,21 @@ jobs:
         run: |
           set -e
           cat > out/NOTES.md <<EOF
-          Independently built from [matiasman1/Asevoxel-Dev@${{ steps.rev.outputs.sha }}](https://github.com/matiasman1/Asevoxel-Dev/commit/${{ steps.rev.outputs.sha }}).
+          Built from this repo's mirrored source at commit
+          [${{ steps.rev.outputs.sha }}](https://github.com/${{ github.repository }}/tree/${{ steps.rev.outputs.sha }}/source)
+          (see \`source/MIRROR_INFO.md\` for which Asevoxel-Dev commit that
+          mirrors).
 
-          package.json version at build time: ${{ steps.rev.outputs.version }}
-
-          Built on a clean GitHub-hosted \`windows-latest\` runner using the exact
-          MSYS2/g++ commands from Asevoxel-Dev's \`create_extension.ps1\`, with no
-          local/manual toolchain state. See CHECKSUMS.sha256 for SHA-256 hashes of
-          every published file, and the "Attestations" tab on this release for a
-          signed provenance record tying these exact bytes back to this exact
-          workflow run and source commit.
+          Built on a clean GitHub-hosted \`windows-latest\` runner using the
+          exact MSYS2/g++ commands Asevoxel-Dev's \`create_extension.ps1\`
+          uses locally. See CHECKSUMS.sha256 for SHA-256 hashes of every
+          published file, and the "Attestations" tab on this release for a
+          signed provenance record tying these exact bytes back to this
+          exact workflow run and source commit.
           EOF
           gh release create "${{ steps.rev.outputs.tag }}" \
             out/asevoxel_compute.exe out/asevoxel_native.dll out/CHECKSUMS.sha256 \
             $( [ -f out/libwinpthread-1.dll ] && echo out/libwinpthread-1.dll ) \
             --repo "$GITHUB_REPOSITORY" \
-            --title "Build ${{ steps.rev.outputs.short }} (v${{ steps.rev.outputs.version }})" \
+            --title "Build ${{ steps.rev.outputs.short }}" \
             --notes-file out/NOTES.md

@@ -12,13 +12,17 @@ the profile antivirus heuristics flag by default, signed or not. AseVoxel
 doesn't (yet) have a code-signing certificate, so instead of asking you to
 just trust an unsigned `.exe`, this repo lets you verify it yourself:
 
-1. A GitHub Actions workflow in this repo checks out the exact source of
-   [Asevoxel-Dev](https://github.com/matiasman1/Asevoxel-Dev) at a given
+Asevoxel-Dev itself is a private repo — most of it needs to stay that way —
+but the [`source/`](source/) directory in *this* repo is a public mirror of
+exactly the C/C++ files that compile into these two binaries (see
+[`source/MIRROR_INFO.md`](source/MIRROR_INFO.md)), kept in sync automatically
+whenever those files change upstream.
+
+1. A GitHub Actions workflow in this repo checks out `source/` at a given
    commit, on a clean, disposable, GitHub-hosted Windows runner — no local
    toolchain state, no manual steps.
 2. It builds both binaries using the *same* MSYS2/g++ commands
-   [`create_extension.ps1`](https://github.com/matiasman1/Asevoxel-Dev/blob/main/create_extension.ps1)
-   uses to build the ones actually shipped.
+   `create_extension.ps1` uses to build the ones actually shipped.
 3. It publishes the binaries, their SHA-256 checksums, and a signed
    [build-provenance attestation](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds)
    (via `actions/attest-build-provenance`) as a GitHub Release here, tagged
