@@ -9,6 +9,7 @@
 #include <string>
 #include <algorithm>
 #include <sys/stat.h>
+#include <chrono>
 
 #ifdef _WIN32
   #include <direct.h>
@@ -353,11 +354,24 @@ int opencl_init(ComputeContext& ctx) {
 }
 
 int opencl_probe() {
+    // BUG-009: timing added to distinguish "slow inside the ICD loader /
+    // driver's clGetPlatformIDs" (implicates the GPU driver) from "slow
+    // outside this function entirely" (process creation, cmd.exe, OS
+    // scheduling — everything compute_bridge.isAvailable()'s outer os.execute()
+    // timing can't see inside of). The first clGetPlatformIDs call is where
+    // the OpenCL ICD loader actually loads and initializes the vendor driver
+    // (amdocl64.dll here), so it's timed in isolation from the cheap per-
+    // device info queries that follow.
+    auto t0 = std::chrono::steady_clock::now();
+
     cl_uint numPlatforms = 0;
     cl_int err = clGetPlatformIDs(0, nullptr, &numPlatforms);
     if (err != CL_SUCCESS) numPlatforms = 0;
 
-    fprintf(stderr, "{\"probe\":true,\"platforms\":[");
+    auto t1 = std::chrono::steady_clock::now();
+    double platformEnumMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    fprintf(stderr, "{\"probe\":true,\"platform_enum_ms\":%.1f,\"platforms\":[", platformEnumMs);
 
     if (numPlatforms > 0) {
         std::vector<cl_platform_id> platforms(numPlatforms);
@@ -405,6 +419,8 @@ int opencl_probe() {
         }
     }
 
-    fprintf(stderr, "]}\n");
+    auto t2 = std::chrono::steady_clock::now();
+    double totalMs = std::chrono::duration<double, std::milli>(t2 - t0).count();
+    fprintf(stderr, "],\"total_ms\":%.1f}\n", totalMs);
     return 0;
 }
