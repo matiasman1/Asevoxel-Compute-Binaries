@@ -4372,6 +4372,12 @@ static int l_render_overlay(lua_State* L) {
 // Forward declaration: defined below FUNCS (needed for FUNCS table reference)
 extern "C" int asevoxel_schedule_unload(lua_State* L);
 
+// BUG-009: forward declarations for the native process-spawn helpers, defined
+// below FUNCS (need windows.h, included further down). See their definitions
+// for the full rationale.
+extern "C" int asevoxel_spawn_capture(lua_State* L);
+extern "C" int asevoxel_spawn_detached(lua_State* L);
+
 static const luaL_Reg FUNCS[] = {
   {"transform_voxel", l_transform_voxel},
   {"calculate_face_visibility", l_calculate_face_visibility},
@@ -4392,6 +4398,12 @@ static const luaL_Reg FUNCS[] = {
   // Schedules FreeLibrary on a background thread so Lua can release the DLL
   // without the file lock preventing extension uninstall/update on Windows.
   {"schedule_unload", asevoxel_schedule_unload},
+  // BUG-009: spawn a child process without requesting a console at all
+  // (CreateProcess + DETACHED_PROCESS), bypassing os.execute()/io.popen()'s
+  // implicit cmd.exe + console-allocation path entirely. See the
+  // definitions below for the full story.
+  {"spawn_capture", asevoxel_spawn_capture},
+  {"spawn_detached", asevoxel_spawn_detached},
   // --------------------------------------------------------------------------
   // BLIT ORCHESTRATOR — double-buffered background rendering
   // --------------------------------------------------------------------------
@@ -4959,6 +4971,245 @@ extern "C" ASEVOXEL_API int asevoxel_schedule_unload(lua_State* L) {
   lua_pushboolean(L, 0);
 #endif
   return 1;
+}
+
+// ---------------------------------------------------------------------------
+// BUG-009: native process spawning that never requests a console.
+//
+// compute_bridge.lua's run_binary()/isAvailable() and daemon_bridge.lua's
+// launch() all used to shell out via os.execute()/io.popen(), which on
+// Windows always goes through cmd.exe. Aseprite.exe is a console-less GUI
+// process, so every such call needs Windows to create a *new* console for
+// the hidden cmd.exe. When Windows Terminal is the system's default terminal
+// application (the modern Windows 11 default) and no WindowsTerminal.exe
+// process happens to already be running, that console-creation handoff has
+// to cold-start a whole new WindowsTerminal.exe process first -- a
+// documented, upstream-confirmed delay of 5+ seconds per occurrence (see
+// microsoft/terminal#19602, #11719). This exactly matches BUG-009's ~5.5-6s
+// per-switch stall, reproduced directly and root-caused in that ticket.
+//
+// CreateProcess with DETACHED_PROCESS requests *no console at all* -- there
+// is nothing to hand off, so this bypasses the whole mechanism regardless of
+// the end user's Windows Terminal / default-terminal-application settings
+// (which AseVoxel has no way to change on their machine, and shouldn't need
+// to -- see BUG-009's "Eighth session" for the system-setting workaround
+// that isn't a real fix for other users).
+// ---------------------------------------------------------------------------
+
+// Quotes a single argument per the MS C runtime command-line parsing rules
+// (https://learn.microsoft.com/en-us/cpp/c-language/parsing-c-command-line-arguments),
+// so CreateProcess's single command-line string round-trips correctly
+// through the child's own argv parsing.
+static std::string quote_arg(const std::string& arg) {
+  if (!arg.empty() && arg.find_first_of(" \t\n\v\"") == std::string::npos) {
+    return arg;
+  }
+  std::string out = "\"";
+  for (size_t i = 0; i < arg.size(); ) {
+    size_t backslashes = 0;
+    while (i < arg.size() && arg[i] == '\\') { backslashes++; i++; }
+    if (i == arg.size()) {
+      out.append(backslashes * 2, '\\');
+      break;
+    } else if (arg[i] == '"') {
+      out.append(backslashes * 2 + 1, '\\');
+      out += '"';
+      i++;
+    } else {
+      out.append(backslashes, '\\');
+      out += arg[i];
+      i++;
+    }
+  }
+  out += '"';
+  return out;
+}
+
+static std::string build_command_line(const std::string& exePath, const std::vector<std::string>& args) {
+  std::string cmd = quote_arg(exePath);
+  for (const auto& a : args) {
+    cmd += ' ';
+    cmd += quote_arg(a);
+  }
+  return cmd;
+}
+
+static std::vector<std::string> lua_string_array(lua_State* L, int idx) {
+  std::vector<std::string> out;
+#ifdef _WIN32
+  lua_Integer n = (lua_Integer)lua_rawlen(L, idx);
+  for (lua_Integer i = 1; i <= n; i++) {
+    lua_geti(L, idx, i);
+    const char* s = lua_tostring(L, -1);
+    out.push_back(s ? s : "");
+    lua_pop(L, 1);
+  }
+#endif
+  return out;
+}
+
+#ifdef _WIN32
+static void read_pipe_to_string(HANDLE h, std::string* out) {
+  char buf[8192];
+  DWORD n = 0;
+  while (ReadFile(h, buf, sizeof(buf), &n, NULL) && n > 0) {
+    out->append(buf, n);
+  }
+}
+#endif
+
+// spawn_capture(exePath, argsArray) -> stdoutData, stderrData, exitCode
+//   or: nil, errorMessage
+//
+// Blocking: waits for the child to exit, capturing all of stdout and
+// stderr. No stdin is provided (nothing in this codebase's usage needs it --
+// input is passed via --stdin-file, a real temp file, not piped stdin).
+extern "C" ASEVOXEL_API int asevoxel_spawn_capture(lua_State* L) {
+  const char* exePath = luaL_checkstring(L, 1);
+  luaL_checktype(L, 2, LUA_TTABLE);
+#ifdef _WIN32
+  std::vector<std::string> args = lua_string_array(L, 2);
+  std::string cmdLine = build_command_line(exePath, args);
+
+  SECURITY_ATTRIBUTES sa;
+  sa.nLength = sizeof(sa);
+  sa.bInheritHandle = TRUE;
+  sa.lpSecurityDescriptor = NULL;
+
+  HANDLE stdoutRead = NULL, stdoutWrite = NULL;
+  HANDLE stderrRead = NULL, stderrWrite = NULL;
+  if (!CreatePipe(&stdoutRead, &stdoutWrite, &sa, 1 << 20) ||
+      !CreatePipe(&stderrRead, &stderrWrite, &sa, 1 << 16)) {
+    lua_pushnil(L);
+    lua_pushstring(L, "CreatePipe failed");
+    return 2;
+  }
+  SetHandleInformation(stdoutRead, HANDLE_FLAG_INHERIT, 0);
+  SetHandleInformation(stderrRead, HANDLE_FLAG_INHERIT, 0);
+
+  HANDLE nulRead = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                &sa, OPEN_EXISTING, 0, NULL);
+
+  STARTUPINFOA si;
+  ZeroMemory(&si, sizeof(si));
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdInput  = nulRead;
+  si.hStdOutput = stdoutWrite;
+  si.hStdError  = stderrWrite;
+
+  PROCESS_INFORMATION pi;
+  ZeroMemory(&pi, sizeof(pi));
+
+  std::vector<char> cmdLineBuf(cmdLine.begin(), cmdLine.end());
+  cmdLineBuf.push_back('\0');
+
+  BOOL ok = CreateProcessA(
+      NULL, cmdLineBuf.data(), NULL, NULL, TRUE,
+      DETACHED_PROCESS, NULL, NULL, &si, &pi);
+
+  CloseHandle(stdoutWrite);
+  CloseHandle(stderrWrite);
+  if (nulRead != INVALID_HANDLE_VALUE) CloseHandle(nulRead);
+
+  if (!ok) {
+    DWORD err = GetLastError();
+    CloseHandle(stdoutRead);
+    CloseHandle(stderrRead);
+    lua_pushnil(L);
+    lua_pushfstring(L, "CreateProcess failed, error %d", (int)err);
+    return 2;
+  }
+  CloseHandle(pi.hThread);
+
+  std::string stdoutData, stderrData;
+  // stderr read on a background thread: it only ever carries small JSON
+  // diagnostics in this codebase's usage, but reading it concurrently with
+  // stdout (which carries the large RGBA payload) rules out any deadlock if
+  // both pipes filled at once.
+  std::thread stderrThread([&]() { read_pipe_to_string(stderrRead, &stderrData); });
+  read_pipe_to_string(stdoutRead, &stdoutData);
+  stderrThread.join();
+
+  CloseHandle(stdoutRead);
+  CloseHandle(stderrRead);
+
+  WaitForSingleObject(pi.hProcess, INFINITE);
+  DWORD exitCode = 0;
+  GetExitCodeProcess(pi.hProcess, &exitCode);
+  CloseHandle(pi.hProcess);
+
+  lua_pushlstring(L, stdoutData.data(), stdoutData.size());
+  lua_pushlstring(L, stderrData.data(), stderrData.size());
+  lua_pushinteger(L, (lua_Integer)exitCode);
+  return 3;
+#else
+  lua_pushnil(L);
+  lua_pushstring(L, "spawn_capture not implemented on this platform (os.execute/io.popen have no console-handoff issue outside Windows)");
+  return 2;
+#endif
+}
+
+// spawn_detached(exePath, argsArray) -> pid
+//   or: nil, errorMessage
+//
+// Fire-and-forget: does not wait for exit or capture output. Used for the
+// long-running Compute Daemon process; reachability is checked separately
+// over its WebSocket port, not by reading its stdio.
+extern "C" ASEVOXEL_API int asevoxel_spawn_detached(lua_State* L) {
+  const char* exePath = luaL_checkstring(L, 1);
+  luaL_checktype(L, 2, LUA_TTABLE);
+#ifdef _WIN32
+  std::vector<std::string> args = lua_string_array(L, 2);
+  std::string cmdLine = build_command_line(exePath, args);
+
+  SECURITY_ATTRIBUTES sa;
+  sa.nLength = sizeof(sa);
+  sa.bInheritHandle = TRUE;
+  sa.lpSecurityDescriptor = NULL;
+
+  HANDLE nulRead  = CreateFileA("NUL", GENERIC_READ,  FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+  HANDLE nulWrite = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+
+  STARTUPINFOA si;
+  ZeroMemory(&si, sizeof(si));
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdInput  = nulRead;
+  si.hStdOutput = nulWrite;
+  si.hStdError  = nulWrite;
+
+  PROCESS_INFORMATION pi;
+  ZeroMemory(&pi, sizeof(pi));
+
+  std::vector<char> cmdLineBuf(cmdLine.begin(), cmdLine.end());
+  cmdLineBuf.push_back('\0');
+
+  BOOL ok = CreateProcessA(
+      NULL, cmdLineBuf.data(), NULL, NULL, TRUE,
+      DETACHED_PROCESS, NULL, NULL, &si, &pi);
+
+  if (nulRead  != INVALID_HANDLE_VALUE) CloseHandle(nulRead);
+  if (nulWrite != INVALID_HANDLE_VALUE) CloseHandle(nulWrite);
+
+  if (!ok) {
+    DWORD err = GetLastError();
+    lua_pushnil(L);
+    lua_pushfstring(L, "CreateProcess failed, error %d", (int)err);
+    return 2;
+  }
+
+  DWORD pid = pi.dwProcessId;
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+
+  lua_pushinteger(L, (lua_Integer)pid);
+  return 1;
+#else
+  lua_pushnil(L);
+  lua_pushstring(L, "spawn_detached not implemented on this platform");
+  return 2;
+#endif
 }
 
 extern "C" ASEVOXEL_API int luaopen_asevoxel_native(lua_State* L) {
