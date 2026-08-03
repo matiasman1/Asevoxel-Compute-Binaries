@@ -4148,6 +4148,24 @@ static int l_render_overlay(lua_State* L) {
     gvz = 1.f; // camera looks along -Z toward model center → view = (0,0,1)
   }
 
+  // BUG-016: optional idMap for ghost-voxel occlusion — the same sparse Lua
+  // table previewRenderer.getEditIdMap() already produces (keyed
+  // y*idMapW+x, entries {voxelIdx, face, worldX, worldY, worldZ}), passed
+  // straight through rather than serialized. Looked up once per ghost voxel
+  // (not per pixel), same granularity as ui_overlay_renderer.lua's
+  // isVoxelOccluded.
+  const int idMapArg = 3;
+  bool hasIdMap = lua_istable(L, idMapArg);
+  int idMapW = 0;
+  if (lua_isnumber(L, 4)) idMapW = (int)lua_tointeger(L, 4);
+  if (idMapW <= 0) hasIdMap = false;
+  // Row 3 of the combined rotation (Rz·Ry·Rx): camera-forward component only
+  // — matches ui_overlay_renderer.lua's voxelCamZ (Z rotation doesn't affect
+  // depth). Applied to *unrotated* positions, same as voxelCamZ's callers.
+  float m31 = -sy_;
+  float m32 = cy_ * sx_;
+  float m33 = cy_ * cx_;
+
   // Parse UI voxels
   size_t count = lua_rawlen(L, 1);
   lua_createtable(L, 0, 3);
@@ -4200,6 +4218,7 @@ static int l_render_overlay(lua_State* L) {
   std::vector<FacePoly> polys;
   polys.reserve(uiVoxels.size() * 6);
   float threshold = -0.001f;
+  std::vector<bool> occluded(uiVoxels.size(), false);
 
   for (size_t vi = 0; vi < uiVoxels.size(); vi++) {
     auto& v = uiVoxels[vi];
@@ -4211,6 +4230,28 @@ static int l_render_overlay(lua_State* L) {
     float worldX = x + midX;
     float worldY = y + midY;
     float worldZ = z + midZ;
+
+    if (hasIdMap) {
+      float depthC = camZ - worldZ;
+      if (depthC < 0.001f) depthC = 0.001f;
+      float sC = perspective ? (focalLength / depthC) : 1.0f;
+      int sx = (int)std::floor(screenCX + (worldX - midX) * voxelSize * sC + 0.5f);
+      int sy = (int)std::floor(screenCY + (worldY - midY) * voxelSize * sC + 0.5f);
+      if (sx >= 0 && sx < width && sy >= 0 && sy < height) {
+        lua_pushinteger(L, (lua_Integer)sy * idMapW + sx);
+        lua_gettable(L, idMapArg);
+        if (lua_istable(L, -1)) {
+          float ex = (float)getNum(L, -1, "worldX", 0.0);
+          float ey = (float)getNum(L, -1, "worldY", 0.0);
+          float ez = (float)getNum(L, -1, "worldZ", 0.0);
+          float ghostCamZ = m31 * (v.x - midX) + m32 * (v.y - midY) + m33 * (v.z - midZ);
+          float realCamZ  = m31 * (ex - midX)  + m32 * (ey - midY)  + m33 * (ez - midZ);
+          if (realCamZ < ghostCamZ - 0.5f) occluded[vi] = true;
+        }
+        lua_pop(L, 1);
+      }
+      if (occluded[vi]) continue;
+    }
 
     for (int f = 0; f < 6; f++) {
       float nx = LOCAL_FACE_NORMALS[f][0];
@@ -4293,6 +4334,7 @@ static int l_render_overlay(lua_State* L) {
   for (size_t vi = 0; vi < uiVoxels.size(); vi++) {
     auto& v = uiVoxels[vi];
     if (v.style == 0) continue; // solid: no extra edges needed
+    if (occluded[vi]) continue; // BUG-016: skip edges for occluded ghosts too
 
     float x = v.x - midX, y = v.y - midY, z = v.z - midZ;
     { float y2 = y*cx_ - z*sx_; float z2 = y*sx_ + z*cx_; y = y2; z = z2; }
