@@ -33,6 +33,12 @@ extern "C" {
 #endif
 static constexpr double PI = 3.14159265358979323846;
 
+// Packs voxel-grid integer coordinates into a single key for hash-set/map lookups
+// (avoids per-face std::string allocation/hashing in occupancy checks).
+static long long pack_coords(int x, int y, int z) {
+  return ((long long)(x + 1000000) << 40) | ((long long)(y + 1000000) << 20) | (z + 1000000);
+}
+
 static double getNum(lua_State* L, int idx, const char* k, double def=0.0) {
   double r = def;
   lua_getfield(L, idx, k);
@@ -546,15 +552,15 @@ static int l_render_basic(lua_State* L){
     lua_pop(L,1);
   }
 
-  // Build occupancy map for mesh mode (string key "x,y,z")
-  std::unordered_set<std::string> occ;
+  // Build occupancy map for mesh mode (packed integer key, see pack_coords)
+  std::unordered_set<long long> occ;
   if (meshMode) {
     occ.reserve(voxels.size()*2);
     for (auto &v : voxels) {
       int ix = (int)std::lround(v.x);
       int iy = (int)std::lround(v.y);
       int iz = (int)std::lround(v.z);
-      occ.emplace(std::to_string(ix)+","+std::to_string(iy)+","+std::to_string(iz));
+      occ.insert(pack_coords(ix, iy, iz));
     }
   }
 
@@ -803,8 +809,7 @@ static int l_render_basic(lua_State* L){
         int nnx = ix + neigh[f].dx;
         int nny = iy + neigh[f].dy;
         int nnz = iz + neigh[f].dz;
-        std::string key = std::to_string(nnx)+","+std::to_string(nny)+","+std::to_string(nnz);
-        if (occ.find(key) != occ.end()) {
+        if (occ.find(pack_coords(nnx, nny, nnz)) != occ.end()) {
           continue; // interior, skip
         }
       }
@@ -892,19 +897,19 @@ static int l_render_basic(lua_State* L){
   auto previewVoxels = readPreviewVoxels(L, 2);
   if (!previewVoxels.empty()) {
     // Build combined occupancy (model + preview) for preview interior culling
-    std::unordered_set<std::string> combinedOcc;
+    std::unordered_set<long long> combinedOcc;
     combinedOcc.reserve((voxels.size() + previewVoxels.size()) * 2);
     for (auto &v : voxels) {
       int ix = (int)std::lround(v.x);
       int iy = (int)std::lround(v.y);
       int iz = (int)std::lround(v.z);
-      combinedOcc.emplace(std::to_string(ix)+","+std::to_string(iy)+","+std::to_string(iz));
+      combinedOcc.insert(pack_coords(ix, iy, iz));
     }
     for (auto &v : previewVoxels) {
       int ix = (int)std::lround(v.x);
       int iy = (int)std::lround(v.y);
       int iz = (int)std::lround(v.z);
-      combinedOcc.emplace(std::to_string(ix)+","+std::to_string(iy)+","+std::to_string(iz));
+      combinedOcc.insert(pack_coords(ix, iy, iz));
     }
 
     polys.reserve(polys.size() + previewVoxels.size() * 3);
@@ -925,8 +930,7 @@ static int l_render_basic(lua_State* L){
           int nnx = ix + PREVIEW_NEIGH[f][0];
           int nny = iy + PREVIEW_NEIGH[f][1];
           int nnz = iz + PREVIEW_NEIGH[f][2];
-          std::string key = std::to_string(nnx)+","+std::to_string(nny)+","+std::to_string(nnz);
-          if (combinedOcc.find(key) != combinedOcc.end()) continue;
+          if (combinedOcc.find(pack_coords(nnx, nny, nnz)) != combinedOcc.end()) continue;
         }
 
         float fnx = rotNormals[f][0];
@@ -1023,10 +1027,6 @@ struct ModelContext {
     int minX, minY, minZ;
     int sizeX, sizeY, sizeZ;
 };
-
-static long long pack_coords(int x, int y, int z) {
-    return ((long long)(x + 1000000) << 40) | ((long long)(y + 1000000) << 20) | (z + 1000000);
-}
 
 extern "C" {
 
@@ -2042,15 +2042,26 @@ static int l_render_shader_stack(lua_State* L) {
             {0, -1, 0}   // bottom: neighbor at -Y
         };
         
-        for (auto& v : voxels) {
+        // Thread-local face buffers (avoid mutex/contention on push_back)
+        int maxThreads = omp_get_max_threads();
+        std::vector<std::vector<native_face_data_t>> thread_faces(maxThreads);
+        {
+            size_t perThread = voxels.size() * 6 / maxThreads + 256;
+            for (auto& tf : thread_faces) tf.reserve(perThread);
+        }
+
+        #pragma omp parallel for schedule(dynamic, 256)
+        for (size_t vidx = 0; vidx < voxels.size(); vidx++) {
+            const auto& v = voxels[vidx];
+            int tid = omp_get_thread_num();
             int vx = (int)v.x, vy = (int)v.y, vz = (int)v.z;
-            
+
             float x = v.x - midX, y = v.y - midY, z = v.z - midZ;
             { float y2 = y * cx - z * sx; float z2 = y * sx + z * cx; y = y2; z = z2; }
             { float x2 = x * cy + z * sy; float z3 = -x * sy + z * cy; x = x2; z = z3; }
             { float x3 = x * cz - y * sz; float y3 = x * sz + y * cz; x = x3; y = y3; }
             float worldX = x + midX, worldY = y + midY, worldZ = z + midZ;
-            
+
             float vxv, vyv, vzv;
             if (orth) { vxv = 0.f; vyv = 0.f; vzv = 1.f; }
             else {
@@ -2058,7 +2069,7 @@ static int l_render_shader_stack(lua_State* L) {
                 float m = std::sqrt(vxv * vxv + vyv * vyv + vzv * vzv);
                 if (m > 1e-5f) { vxv /= m; vyv /= m; vzv /= m; }
             }
-            
+
             for (int f = 0; f < 6; f++) {
                 // Interior face culling: skip face if neighbor voxel exists in that direction
                 int nx_off = vx + NEIGHBOR_OFFSET[f][0];
@@ -2067,7 +2078,7 @@ static int l_render_shader_stack(lua_State* L) {
                 if (modelCtx.voxel_map.count(pack_coords(nx_off, ny_off, nz_off))) {
                     continue;  // Neighbor exists, face is occluded
                 }
-                
+
                 float nx = LOCAL_FACE_NORMALS[f][0];
                 float ny = LOCAL_FACE_NORMALS[f][1];
                 float nz = LOCAL_FACE_NORMALS[f][2];
@@ -2078,15 +2089,15 @@ static int l_render_shader_stack(lua_State* L) {
                 }
                 float dot = nx * vxv + ny * vyv + nz * vzv;
                 if (dot <= threshold) continue;  // Backface culling
-                
+
                 native_face_data_t face;
                 face.x = vx; face.y = vy; face.z = vz;
-                
+
                 face.face_dir = internalFaceToApiDir(f);
-                
+
                 face.r = v.r; face.g = v.g; face.b = v.b; face.a = v.a;
                 face.normal[0] = nx; face.normal[1] = ny; face.normal[2] = nz;
-                
+
                 // Compute face depth as average of all 4 rotated vertex Z coords
                 float avgDepth = 0.f;
                 for (int vi = 0; vi < 4; vi++) {
@@ -2102,9 +2113,14 @@ static int l_render_shader_stack(lua_State* L) {
                     avgDepth += (camZ - wz);
                 }
                 face.depth = perspective ? std::max(0.001f, avgDepth / 4.f) : avgDepth / 4.f;
-                
-                batch_faces.push_back(face);
+
+                thread_faces[tid].push_back(face);
             }
+        }
+
+        // Merge thread-local buffers into batch_faces
+        for (auto& tf : thread_faces) {
+            batch_faces.insert(batch_faces.end(), std::make_move_iterator(tf.begin()), std::make_move_iterator(tf.end()));
         }
     }
     
@@ -2741,13 +2757,13 @@ static int l_render_fast(lua_State* L) {
     }
     
     // Build occupancy map for interior culling
-    std::unordered_set<std::string> occ;
+    std::unordered_set<long long> occ;
     occ.reserve(voxels.size() * 2);
     for (auto& v : voxels) {
         int ix = (int)std::lround(v.x);
         int iy = (int)std::lround(v.y);
         int iz = (int)std::lround(v.z);
-        occ.emplace(std::to_string(ix) + "," + std::to_string(iy) + "," + std::to_string(iz));
+        occ.insert(pack_coords(ix, iy, iz));
     }
     
     // Center point and rotation
@@ -2840,41 +2856,50 @@ static int l_render_fast(lua_State* L) {
     };
     std::vector<FastVoxel> drawList;
     drawList.reserve(voxels.size());
-    
+
+    // Thread-local draw-list buffers (avoid mutex/contention on push_back)
+    int maxThreads = omp_get_max_threads();
+    std::vector<std::vector<FastVoxel>> thread_drawList(maxThreads);
+    {
+        size_t perThread = voxels.size() / maxThreads + 256;
+        for (auto& tl : thread_drawList) tl.reserve(perThread);
+    }
+
+    #pragma omp parallel for schedule(dynamic, 256)
     for (size_t vi = 0; vi < voxels.size(); vi++) {
-        auto& v = voxels[vi];
+        const auto& v = voxels[vi];
+        int tid = omp_get_thread_num();
         int ix = (int)std::lround(v.x);
         int iy = (int)std::lround(v.y);
         int iz = (int)std::lround(v.z);
-        
+
         // Step 1: Find which faces are NOT culled by neighbors
         bool faceUnculled[6] = {false};
         bool hasAnyVisibleFace = false;
-        
+
         for (int f = 0; f < 6; f++) {
             int nx = ix + neigh[f][0];
             int ny = iy + neigh[f][1];
             int nz = iz + neigh[f][2];
-            std::string key = std::to_string(nx) + "," + std::to_string(ny) + "," + std::to_string(nz);
-            if (occ.find(key) == occ.end()) {
+            if (occ.find(pack_coords(nx, ny, nz)) == occ.end()) {
                 // No neighbor in this direction - face is potentially visible
                 faceUnculled[f] = true;
                 hasAnyVisibleFace = true;
             }
         }
-        
+
         if (!hasAnyVisibleFace) continue;  // Skip completely interior voxels
-        
+
         // Step 2: Calculate visibility weights for ALL camera-facing unculled faces
         // Maximum 3 faces can be visible from any single viewpoint (corner view)
         float viewDir[3] = {0, 0, 1};
-        
+
         // Collect all camera-facing faces with their dot products
         struct FaceVis { int face; float dot; };
         FaceVis visFaces[6];
         int numVisFaces = 0;
         float totalDot = 0.0f;
-        
+
         for (int f = 0; f < 6; f++) {
             if (!faceUnculled[f]) continue;
             float dot = rotNormals[f][0] * viewDir[0] + rotNormals[f][1] * viewDir[1] + rotNormals[f][2] * viewDir[2];
@@ -2885,10 +2910,10 @@ static int l_render_fast(lua_State* L) {
                 numVisFaces++;
             }
         }
-        
+
         // Skip if no faces are camera-facing
         if (numVisFaces == 0) continue;
-        
+
         // Sort by dot product (most visible first)
         for (int i = 0; i < numVisFaces - 1; i++) {
             for (int j = i + 1; j < numVisFaces; j++) {
@@ -2899,21 +2924,21 @@ static int l_render_fast(lua_State* L) {
                 }
             }
         }
-        
+
         // Primary visible face is the one with highest dot product
         int visibleFace = visFaces[0].face;
-        
+
         // Step 3: Rotate voxel center
         float x = v.x - midX, y = v.y - midY, z = v.z - midZ;
         { float y2 = y * cx - z * sx; float z2 = y * sx + z * cx; y = y2; z = z2; }
         { float x2 = x * cy + z * sy; float z3 = -x * sy + z * cy; x = x2; z = z3; }
         { float x3 = x * cz - y * sz; float y3 = x * sz + y * cz; x = x3; y = y3; }
-        
+
         // Project to screen
         float screenX = screenCX + x * scale;
         float screenY = screenCY + y * scale;
         float depth = z;
-        
+
         FastVoxel fv;
         fv.screenX = screenX;
         fv.screenY = screenY;
@@ -2930,7 +2955,7 @@ static int l_render_fast(lua_State* L) {
         fv.normalX = rotNormals[visibleFace][0];
         fv.normalY = rotNormals[visibleFace][1];
         fv.normalZ = rotNormals[visibleFace][2];
-        
+
         // Store weighted multi-face data (up to 3 faces)
         fv.numVisibleFaces = std::min(numVisFaces, 3);
         for (int i = 0; i < fv.numVisibleFaces; i++) {
@@ -2942,10 +2967,15 @@ static int l_render_fast(lua_State* L) {
             fv.visibleFaces[i].normalZ = rotNormals[f][2];
         }
         fv.voxelId = (uint32_t)(vi + 1); // 1-based for Lua
-        
-        drawList.push_back(fv);
+
+        thread_drawList[tid].push_back(fv);
     }
-    
+
+    // Merge thread-local buffers into drawList
+    for (auto& tl : thread_drawList) {
+        drawList.insert(drawList.end(), std::make_move_iterator(tl.begin()), std::make_move_iterator(tl.end()));
+    }
+
     // ========================================================================
     // Execute shader pipeline if shaders are enabled
     // Uses BATCHED WEIGHTED MULTI-FACE LIGHTING: build all face data first,
@@ -3243,9 +3273,9 @@ static int l_render_fast(lua_State* L) {
         auto previewVoxels = readPreviewVoxels(L, 2);
         if (!previewVoxels.empty()) {
             // Build combined occupancy for preview interior culling
-            std::unordered_set<std::string> combinedOcc = occ;
+            std::unordered_set<long long> combinedOcc = occ;
             for (auto& pv : previewVoxels) {
-                combinedOcc.insert(std::to_string((int)pv.x) + "," + std::to_string((int)pv.y) + "," + std::to_string((int)pv.z));
+                combinedOcc.insert(pack_coords((int)pv.x, (int)pv.y, (int)pv.z));
             }
 
             float viewDir[3] = {0.f, 0.f, 1.f};
@@ -3259,7 +3289,7 @@ static int l_render_fast(lua_State* L) {
                 int bestFace = -1;
                 float bestDot = 0.f;
                 for (int f = 0; f < 6; f++) {
-                    std::string key = std::to_string(ix + neigh[f][0]) + "," + std::to_string(iy + neigh[f][1]) + "," + std::to_string(iz + neigh[f][2]);
+                    long long key = pack_coords(ix + neigh[f][0], iy + neigh[f][1], iz + neigh[f][2]);
                     if (combinedOcc.find(key) != combinedOcc.end()) continue;
                     float dot = rotNormals[f][0] * viewDir[0] + rotNormals[f][1] * viewDir[1] + rotNormals[f][2] * viewDir[2];
                     if (dot > bestDot) { bestDot = dot; bestFace = f; }
@@ -3293,9 +3323,13 @@ static int l_render_fast(lua_State* L) {
         }
     }
     
-    // Sort by depth (painter's algorithm - back to front)
+    // Sort by depth (painter's algorithm - back to front).
+    // Tiebreak on voxelId for determinism: parallel drawList construction no longer
+    // guarantees voxel-index insertion order, so equal-depth ties must be broken
+    // explicitly to keep pixel output stable across runs.
     std::sort(drawList.begin(), drawList.end(), [](const FastVoxel& a, const FastVoxel& b) {
-        return a.depth < b.depth;  // Smaller depth (further) drawn first
+        if (a.depth != b.depth) return a.depth < b.depth;  // Smaller depth (further) drawn first
+        return a.voxelId < b.voxelId;
     });
     
     // Initialize buffer with background
