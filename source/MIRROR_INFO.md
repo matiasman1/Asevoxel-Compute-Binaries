@@ -23,4 +23,4 @@ branch that touch `src/**`, `asevoxel_native.cpp`, or the build commands in
 `create_extension.ps1` re-push the affected files here via a scheduled
 mirror workflow in the private repo.
 
-Last synced from Asevoxel-Dev commit: `c8b5803c5793db5a436f8cea23fa25f6b0b56e32`
+Last synced from Asevoxel-Dev commit: `1a151802622558a9c88d78d315667dadb96e48dc`

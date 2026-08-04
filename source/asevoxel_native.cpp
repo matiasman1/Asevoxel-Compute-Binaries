@@ -4280,7 +4280,9 @@ static int l_render_overlay(lua_State* L) {
           float ez = (float)getNum(L, -1, "worldZ", 0.0);
           float ghostCamZ = m31 * (v.x - midX) + m32 * (v.y - midY) + m33 * (v.z - midZ);
           float realCamZ  = m31 * (ex - midX)  + m32 * (ey - midY)  + m33 * (ez - midZ);
-          if (realCamZ < ghostCamZ - 0.5f) occluded[vi] = true;
+          // Larger camZ = closer to camera (camZ = midZ + camDist above, depth
+          // = camZ - worldZ, so larger worldZ/camZ means smaller depth).
+          if (realCamZ > ghostCamZ + 0.5f) occluded[vi] = true;
         }
         lua_pop(L, 1);
       }
