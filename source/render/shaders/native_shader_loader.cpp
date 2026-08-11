@@ -14,6 +14,15 @@
 
 namespace native_shader_loader {
 
+// Off by default -- kept in sync with asevoxel_native.cpp's g_debug_shader_params
+// via set_debug(), called from l_set_debug_shader_params. See config.lua /
+// render/native_bridge.lua's setDebugLogging for how this gets enabled.
+static bool g_loader_debug = false;
+
+void set_debug(bool enabled) {
+    g_loader_debug = enabled;
+}
+
 struct LoadedShader {
     void* dl_handle;                      // dlopen handle
     const native_shader_v1_t* iface;      // Shader interface
@@ -305,8 +314,10 @@ int scan_directory(const char* shader_dir) {
         
         loaded_count++;
         
-        printf("[native_shader_loader] Loaded shader '%s' from %s (API v%d.%d)\n",
-               shader_id, name, ver.major, ver.minor);
+        if (g_loader_debug) {
+            printf("[native_shader_loader] Loaded shader '%s' from %s (API v%d.%d)\n",
+                   shader_id, name, ver.major, ver.minor);
+        }
     }
     
     closedir(dir);

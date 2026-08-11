@@ -32,6 +32,10 @@ void destroy_shader_instance(const char* shader_id, void* instance);
 // Unload all shaders and clean up
 void unload_all();
 
+// Enable/disable the "[native_shader_loader] Loaded shader ..." success log.
+// Off by default; kept in sync with asevoxel_native.cpp's g_debug_shader_params.
+void set_debug(bool enabled);
+
 } // namespace native_shader_loader
 
 #endif // NATIVE_SHADER_LOADER_HPP

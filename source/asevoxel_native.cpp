@@ -2272,43 +2272,47 @@ static int l_render_shader_stack(lua_State* L) {
             if (!s.iface->run_voxel_batch) continue;
             
             std::string effName = getEffectiveName(s);
-            printf("[native] Executing shader: %s (colorInput=%s)\n", effName.c_str(), s.colorInput.c_str());
-            
+            if (g_debug_shader_params) {
+                printf("[native] Executing shader: %s (colorInput=%s)\n", effName.c_str(), s.colorInput.c_str());
+            }
+
             // Get input colors based on colorInput
             const ColorBuffer& inputColors = getSourceColors(s.colorInput);
-            
+
             // Debug: print first face color before apply
-            if (!batch_faces.empty()) {
-                printf("[native]   Before applyTo: face[0] = (%d,%d,%d)\n", 
+            if (g_debug_shader_params && !batch_faces.empty()) {
+                printf("[native]   Before applyTo: face[0] = (%d,%d,%d)\n",
                        batch_faces[0].r, batch_faces[0].g, batch_faces[0].b);
                 printf("[native]   inputColors[0] = (%d,%d,%d)\n",
                        inputColors.r[0], inputColors.g[0], inputColors.b[0]);
             }
-            
+
             // Apply input colors to faces
             inputColors.applyTo(batch_faces);
-            
+
             // Debug: print first face color after apply
-            if (!batch_faces.empty()) {
-                printf("[native]   After applyTo: face[0] = (%d,%d,%d)\n", 
+            if (g_debug_shader_params && !batch_faces.empty()) {
+                printf("[native]   After applyTo: face[0] = (%d,%d,%d)\n",
                        batch_faces[0].r, batch_faces[0].g, batch_faces[0].b);
             }
-            
+
             // Execute shader (modifies batch_faces in place)
             s.iface->run_voxel_batch(s.instance, &ctx, (int)batch_faces.size(), batch_faces.data());
-            
+
             // Debug: print first face color after shader
-            if (!batch_faces.empty()) {
-                printf("[native]   After shader run: face[0] = (%d,%d,%d)\n", 
+            if (g_debug_shader_params && !batch_faces.empty()) {
+                printf("[native]   After shader run: face[0] = (%d,%d,%d)\n",
                        batch_faces[0].r, batch_faces[0].g, batch_faces[0].b);
             }
-            
+
             // Capture output colors
             ColorBuffer outputColors;
             outputColors.copyFrom(batch_faces);
-            
+
             // Debug: print what we're storing
-            printf("[native]   Storing output as: %s\n", getEffectiveName(s).c_str());
+            if (g_debug_shader_params) {
+                printf("[native]   Storing output as: %s\n", getEffectiveName(s).c_str());
+            }
             
             // Handle addTo: additive accumulation
             if (!s.addTo.empty()) {
@@ -2535,7 +2539,10 @@ static int l_render_shader_stack(lua_State* L) {
 // ============================================================================
 static int l_set_debug_shader_params(lua_State* L) {
     g_debug_shader_params = lua_toboolean(L, 1) != 0;
-    printf("[native] Shader param debug: %s\n", g_debug_shader_params ? "ON" : "OFF");
+    native_shader_loader::set_debug(g_debug_shader_params);
+    if (g_debug_shader_params) {
+        printf("[native] Shader param debug: ON\n");
+    }
     lua_pushboolean(L, g_debug_shader_params);
     return 1;
 }
