@@ -2636,7 +2636,17 @@ static int l_render_fast(lua_State* L) {
     float shadeIntensity = (float)getNum(L, 2, "basicShadeIntensity", 100.0);
     float lightIntensity = (float)getNum(L, 2, "basicLightIntensity", 0.0);
     float voxelPadding = (float)getNum(L, 2, "voxelPadding", 2.0); // Default 2 to match aseSlab
-    
+
+    // BUG-033 Cause A: FOV/perspective camera params (previously never parsed
+    // here at all, so this renderer always projected orthographic regardless
+    // of the UI toggle). v1 scope: only the "middle" perspectiveScaleRef
+    // (matching l_render_basic's default) -- no front/back ref support here.
+    float fovDeg = (float)getNum(L, 2, "fovDegrees", 0.0);
+    lua_getfield(L, 2, "orthogonal");
+    bool orthogonal = lua_toboolean(L, -1) != 0; lua_pop(L, 1);
+    float perspIntensity = (float)getNum(L, 2, "perspectiveIntensity", 1.0);
+    if (perspIntensity <= 0.f) perspIntensity = 1.0f;
+
     // Parse editMode for ID map output
     bool editMode = false;
     lua_getfield(L, 2, "editMode");
@@ -2787,14 +2797,32 @@ static int l_render_fast(lua_State* L) {
         midZ = 0.5f * (minZ + maxZ);
     }
     lua_pop(L, 1);
-    
+
+    // BUG-033 Cause A: perspective/FOV camera setup, mirroring l_render_basic's
+    // (see ~line 605-625) but simplified to the "middle" perspectiveScaleRef
+    // only. Effective span uses the same computeCameraBounds helper as the
+    // accurate/basic renderers for consistency (handles globalBounds and
+    // rotation-radius edge cases the same way).
+    CameraBounds camB = computeCameraBounds(L, 2, minX, maxX, minY, maxY, minZ, maxZ, midX, midY, midZ);
+    bool perspective = (!orthogonal && fovDeg > 0.f);
+    float camDist = camB.effectiveSpan * 5.f;
+    if (perspective) {
+        float fovDegC = std::max(5.f, std::min(75.f, fovDeg));
+        float warpT = (fovDegC - 5.f) / (75.f - 5.f);
+        float amplified = std::pow(warpT, 1.f / 3.f);
+        const float BASE_NEAR = 1.2f;
+        const float FAR_EXTRA = 45.f;
+        camDist = camB.effectiveSpan * (BASE_NEAR + (1.f - amplified) * (1.f - amplified) * FAR_EXTRA);
+        camDist *= perspIntensity;
+    }
+
     float RX = xRotDeg * (float)PI / 180.f;
     float RY = yRotDeg * (float)PI / 180.f;
     float RZ = zRotDeg * (float)PI / 180.f;
     float cx = std::cos(RX), sx = std::sin(RX);
     float cy = std::cos(RY), sy = std::sin(RY);
     float cz = std::cos(RZ), sz = std::sin(RZ);
-    
+
     // Rotate face normals to determine face visibility
     float rotNormals[6][3];
     for (int f = 0; f < 6; f++) {
@@ -2820,9 +2848,10 @@ static int l_render_fast(lua_State* L) {
                         std::fabs(std::sin(RZ * 2.f)) * 0.25f;
     // Clamp expansion factor between 1.0 and 1.45 (sqrt(2))
     float expansion = 1.0f + std::min(0.45f, angleEffect * 0.5f);
-    
-    float voxelSize = (scale * expansion) + voxelPadding;  // Dynamic size based on rotation
-    float halfSize = voxelSize / 2.0f;
+    // voxelSize is now computed per-voxel below (BUG-033 Cause A): in
+    // perspective mode it must shrink/grow with each voxel's depth, so it
+    // can no longer be a single value hoisted outside the loop like it was
+    // when this function only ever rendered orthographic.
     float screenCX = width * 0.5f;
     float screenCY = height * 0.5f;
     
@@ -2860,6 +2889,10 @@ static int l_render_fast(lua_State* L) {
         int numVisibleFaces;
         VisibleFaceData visibleFaces[3];
         uint32_t voxelId; // Edit-mode: 1-based voxel array index
+        // BUG-033 Cause A: per-voxel screen-space rect size. Constant across
+        // all voxels in orthogonal mode (equals the old shared `voxelSize`),
+        // but must vary with each voxel's depth in perspective mode.
+        float voxelSize;
     };
     std::vector<FastVoxel> drawList;
     drawList.reserve(voxels.size());
@@ -2941,15 +2974,29 @@ static int l_render_fast(lua_State* L) {
         { float x2 = x * cy + z * sy; float z3 = -x * sy + z * cy; x = x2; z = z3; }
         { float x3 = x * cz - y * sz; float y3 = x * sz + y * cz; x = x3; y = y3; }
 
+        // BUG-033 Cause A: per-voxel depth-based scale in perspective mode.
+        // At the "middle" reference depth (camDist), the per-vertex
+        // focalLength/depth divide algebraically cancels against voxelSize's
+        // own depthRef/focalLength factor (see l_render_basic's derivation),
+        // leaving just camDist/depth -- so focalLength doesn't need to be
+        // computed here at all. Orthogonal keeps the flat `scale`.
+        float effScale = scale;
+        if (perspective) {
+            float depthFromCam = camDist - z;
+            if (depthFromCam < 0.001f) depthFromCam = 0.001f;
+            effScale = scale * (camDist / depthFromCam);
+        }
+
         // Project to screen
-        float screenX = screenCX + x * scale;
-        float screenY = screenCY + y * scale;
+        float screenX = screenCX + x * effScale;
+        float screenY = screenCY + y * effScale;
         float depth = z;
 
         FastVoxel fv;
         fv.screenX = screenX;
         fv.screenY = screenY;
         fv.depth = depth;
+        fv.voxelSize = (effScale * expansion) + voxelPadding;
         fv.r = v.r;
         fv.g = v.g;
         fv.b = v.b;
@@ -3352,18 +3399,21 @@ static int l_render_fast(lua_State* L) {
     }
     
     // Draw rectangles (fast: no polygon rasterization)
-    // Use integer coordinates to avoid sub-pixel gaps
-    int voxelSizeInt = (int)std::round(voxelSize);
-    int halfSizeInt = voxelSizeInt / 2;
-    
+    // Use integer coordinates to avoid sub-pixel gaps.
+    // BUG-033 Cause A: size is now read per-voxel (fv.voxelSize) instead of a
+    // single value hoisted outside this loop -- in perspective mode each
+    // voxel's rect must shrink/grow with its own depth.
+
     // Allocate ID map buffer for edit mode
     std::vector<uint32_t> idMapBuf;
     if (editMode) {
         idMapBuf.resize((size_t)width * height, 0);
     }
-    
+
     for (auto& fv : drawList) {
         // Match Lua: shape.x = screenX - halfSize, shape width/height = voxelSize
+        int voxelSizeInt = (int)std::round(fv.voxelSize);
+        int halfSizeInt = voxelSizeInt / 2;
         int left = (int)std::round(fv.screenX) - halfSizeInt;
         int top = (int)std::round(fv.screenY) - halfSizeInt;
         int right = left + voxelSizeInt - 1;
