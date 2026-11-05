@@ -45,7 +45,8 @@ jobs:
           update: true
           install: >-
             mingw-w64-ucrt-x86_64-gcc
-            mingw-w64-ucrt-x86_64-lua
+            mingw-w64-ucrt-x86_64-libgomp
+            mingw-w64-ucrt-x86_64-lua54
             mingw-w64-ucrt-x86_64-opencl-headers
             mingw-w64-ucrt-x86_64-opencl-icd
 
@@ -69,9 +70,18 @@ jobs:
         run: |
           set -e
           mkdir -p render_bin
+          # Aseprite embeds Lua 5.4 and this DLL links Lua statically, so it
+          # must be built against 5.4. MSYS2's plain lua package is 5.5, which
+          # is ABI-incompatible and crashes Aseprite on startup.
+          test -f /ucrt64/include/lua5.4/lua.h || { echo "lua54 headers missing"; exit 1; }
           g++ -O2 -std=c++17 -shared -static -static-libgcc -static-libstdc++ -fopenmp \
             -o render_bin/asevoxel_native.dll source/asevoxel_native.cpp \
-            -I/ucrt64/include -llua -lpthread -lgomp
+            -I/ucrt64/include/lua5.4 -I/ucrt64/include -llua5.4 -lpthread -lgomp
+          # Fail the build if anything but Lua 5.4 got linked in.
+          ver=$(grep -aoE 'Lua 5\.[0-9]+\.[0-9]+' render_bin/asevoxel_native.dll | sort -u)
+          echo "Linked Lua: $ver"
+          [ "$(echo "$ver" | grep -c '^Lua 5\.4\.')" = "$(echo "$ver" | wc -l)" ] && [ -n "$ver" ] \
+            || { echo "asevoxel_native.dll is not linked against Lua 5.4"; exit 1; }
 
       - name: Checksum binaries
         if: steps.rev.outputs.already_built == 'false'
